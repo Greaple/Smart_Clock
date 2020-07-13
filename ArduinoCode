@@ -1,0 +1,356 @@
+#include <Time.h>
+#include <TimeLib.h>
+#include <WiFiUdp.h>
+#include <TimeAlarms.h>
+#include <MultiStepper.h>
+#include <AccelStepper.h>
+#include <Firebase_Arduino_WiFiNINA.h>
+#include <SPI.h>
+#include <WiFiNINA.h>
+
+
+FirebaseData firebaseData;
+
+AccelStepper minuteStepper(AccelStepper::FULL4WIRE, 2, 3, 4, 5);
+AccelStepper hourStepper(AccelStepper::FULL4WIRE, 6, 7, 8, 9);
+
+WiFiUDP Udp;
+
+IPAddress timeServer(216, 239, 35, 0); // Google NTP Server
+
+const int hourSteps = 60;
+const int minuteSteps = 12;
+const int timeZone = +;
+unsigned long oldTime = 1551880287;
+unsigned long actualTime;
+unsigned long previousTime = 0;
+unsigned int localPort = 2390;
+const int NTP_PACKET_SIZE = 48;     // NTP time stamp is in the first 48 bytes of the message
+byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
+bool isTimerRunning = false;
+String clockMode = "rest";
+int timerStart;
+int timeToGo;
+
+// A UDP instance to let us send and receive packets over UDP
+
+void setup()
+{
+
+  Serial.begin(115200);
+  delay(4000);
+
+  hourStepper.setMaxSpeed(600);
+  hourStepper.setAcceleration(100);
+  minuteStepper.setMaxSpeed(600);
+  minuteStepper.setAcceleration(100);
+
+  pinMode (A7, INPUT);
+  pinMode (11, INPUT);
+  pinMode (LED_BUILTIN, OUTPUT);
+
+  Serial.println("Connecting to Wi-Fi");
+  int status = WL_IDLE_STATUS;
+
+  while (status != WL_CONNECTED)
+  {
+    status = WiFi.begin("[YOUR SSID]", "[PASSWORD]");
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+  Serial.print("Connected to Wi-fi IP : ");
+  Serial.println(WiFi.localIP());
+
+  Firebase.begin("[FIREBASE URL", "[FIREBASE SECRET]", "[SSID]", "[PASSWORD]");
+  Firebase.reconnectWiFi(true);
+
+  /*if (!Firebase.beginStream(firebaseData, "/washer/Timer/timerRemainingSec"))
+{
+  //Could not begin stream connection, then print out the error detail
+  Serial.println(firebaseData.errorReason());
+} */
+
+  Serial.println("\nStarting connection to server...");
+  Udp.begin(localPort);
+
+    // Hall Sensor is LOW when a magnet is close.
+  int hallSensorValue1 = analogRead(A7);
+  int hallSensorValue2 = analogRead(A6);
+  int initialHoming = -1;
+  Serial.print("Hall Sensor is : ");
+  Serial.print(hallSensorValue1);
+  Serial.println(hallSensorValue2);
+  
+ /* while (hallSensorValue1 > 1000) {
+    hourStepper.moveTo(initialHoming);
+    initialHoming--;
+    hourStepper.run();
+    hallSensorValue1 = analogRead(A7);
+  }
+
+  initialHoming = -1;
+
+  while (hallSensorValue2 > 1000) {
+    minuteStepper.moveTo(initialHoming);
+    initialHoming--;
+    minuteStepper.run();
+    hallSensorValue2 = analogRead(A6);
+  }*/
+
+  hourStepper.setCurrentPosition(0);
+  minuteStepper.setCurrentPosition(0);
+
+  
+}
+
+void loop()
+{
+  Serial.println("-------------------------");
+  timerStart = getFirebaseTimer();
+  actualTime = getActualTime();
+  clockMode = getMode();
+  delay(500);
+  long hallSensorValue1 = analogRead(A7);
+
+  if(hallSensorValue1 < 1000) {
+    digitalWrite(LED_BUILTIN, HIGH);
+  } else {
+    digitalWrite(LED_BUILTIN, LOW);
+  }
+  
+
+  int actualHour = hour(actualTime);
+  int actualMinute = minute(actualTime);
+
+  // Display actual time.
+  char formattedCurrentTime[100];
+  sprintf(formattedCurrentTime, "Actual time : %d:%d:%d", hour(actualTime), minute(actualTime), second(actualTime));
+  Serial.println(formattedCurrentTime);
+
+  if (timerStart > 0)
+  {
+    // Asked for new timer,
+
+    // show it :
+    displayTimer(timerStart);
+
+    // then come back on current time :
+    delay(5000);
+    displayActualTime(actualHour, actualMinute);
+
+    // Maybe move this :
+    previousTime = actualTime;
+    timeToGo = timerStart;
+    // Serial.print("timeToGo after init : ");
+    // Serial.println(timeToGo);
+    isTimerRunning = true;
+
+    zeroFirebaseTimer();
+  }
+  else if (clockMode.equals("pasta"))
+  {
+    // "pasta" mode = we want to check timer.
+    Serial.println("MODE : Timer asked for");
+    Serial.print("timeToGo before use : ");
+    Serial.println(timeToGo);
+    int remainingTime = (previousTime + timeToGo) - actualTime;
+    char output[100];
+    sprintf(output, "Remaining time = (%d + %d) - %d = %d", previousTime, timeToGo, actualTime, remainingTime);
+    Serial.println(output);
+
+    if (remainingTime > 0)
+    {
+      Serial.println("MODE : Timer asked for - Display timer");
+      displayTimer(remainingTime);
+    }
+    else
+    {
+      Serial.println("MODE : Timer asked for - Remaining time = 0");
+      remainingTime = 0;
+      isTimerRunning = false;
+      displayActualTime(actualHour, actualMinute);
+    }
+  }
+  else if (clockMode.equals("rest"))
+  {
+    Serial.println("MODE : Let's display time !");
+    Serial.print("Desired hour : ");
+    Serial.println(actualHour);
+    displayActualTime(actualHour, actualMinute);
+  }
+  
+  delay(4000);
+}
+
+void displayTimer(int seconds)
+{
+  Serial.println("Displaying Timer...");
+  int minutes = seconds / 60;
+  hourStepper.moveTo(minutes * minuteSteps);
+  minuteStepper.moveTo(minutes*minuteSteps);
+  // minuteStepper.moveTo(minutes*minuteSteps);
+  moveNeedles();
+}
+
+int getFirebaseTimer()
+{
+
+  int firebaseTimer;
+
+  if (Firebase.getInt(firebaseData, "/washer/Timer/timerRemainingSec"))
+  {
+
+    if (firebaseData.dataType() == "int")
+    {
+      firebaseTimer = firebaseData.intData();
+      Serial.println(firebaseTimer);
+    }
+  }
+  return firebaseTimer;
+}
+
+unsigned long sendNTPpacket(IPAddress &address)
+{
+  //Serial.println("1");
+  // set all bytes in the buffer to 0
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  //Serial.println("2");
+  packetBuffer[0] = 0b11100011; // LI, Version, Mode
+  packetBuffer[1] = 0;          // Stratum, or type of clock
+  packetBuffer[2] = 6;          // Polling Interval
+  packetBuffer[3] = 0xEC;       // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+
+  //Serial.println("3");
+
+  // all NTP fields have been given values, now
+  // you can send a packet requesting a timestamp:
+  Udp.beginPacket(address, 123); //NTP requests are to port 123
+  //Serial.println("4");
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  //Serial.println("5");
+  Udp.endPacket();
+  //Serial.println("6");
+}
+
+unsigned long getActualTime()
+{
+
+  unsigned long epoch;
+
+  sendNTPpacket(timeServer); // send an NTP packet to a time server
+  // wait to see if a reply is available
+  delay(1000);
+  if (Udp.parsePacket())
+  {
+    // We've received a packet, read the data from it
+    Udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
+
+    //the timestamp starts at byte 40 of the received packet and is four bytes,
+    // or two words, long. First, esxtract the two words:
+
+    unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+    unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
+    // combine the four bytes (two words) into a long integer
+    // this is NTP time (seconds since Jan 1 1900):
+    unsigned long secsSince1900 = highWord << 16 | lowWord;
+
+    // now convert NTP time into everyday time:
+    //Serial.print("Unix time = ");
+    // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
+    const unsigned long seventyYears = 2208988800UL;
+    // subtract seventy years:
+    epoch = secsSince1900 - seventyYears + timeZone * 3600;
+    // print Unix time:
+    //Serial.println(epoch);
+    //Serial.println(minute(oldTime));
+
+    //if (minute(epoch) != minute(oldTime)) {
+
+    //Serial.println("hours are different");
+    //oldTime = epoch;
+    //}
+
+    /*Serial.println(hour(epoch));
+  Serial.println(minute(epoch));
+  Serial.println(second(epoch));*/
+  }
+
+  //delay(5000);
+
+  return epoch;
+}
+
+String getMode()
+{
+
+  String firebaseMode;
+
+  if (Firebase.getString(firebaseData, "/washer/Modes/needles"))
+  {
+
+    if (firebaseData.dataType() == "string")
+    {
+      firebaseMode = firebaseData.stringData();
+      Serial.println(firebaseMode);
+    }
+  }
+  return firebaseMode;
+}
+
+void zeroFirebaseTimer()
+{
+
+  if (Firebase.setInt(firebaseData, "/washer/Timer/timerRemainingSec", 0))
+  {
+
+    if (firebaseData.dataType() == "int")
+    {
+      Serial.print("Timer in database set to : ");
+      Serial.println(firebaseData.floatData());
+    }
+    else
+    {
+      //Failed, then print out the error detail
+      Serial.println(firebaseData.errorReason());
+    }
+  }
+}
+
+void displayActualTime(int hours, int minutes)
+{
+  // Serial.print("Heure recue : ");
+  // Serial.println(hours);
+  // Serial.print("Distance to go : ");
+  // Serial.println(hourStepper.distanceToGo());
+  Serial.println("Displaying Actual Time...");
+  // Serial.println((hours % 12) * hourSteps);
+  hourStepper.moveTo((hours % 12) * hourSteps);
+  minuteStepper.moveTo(minutes*minuteSteps);
+  // minuteStepper.moveTo(minutes*minuteSteps);
+  moveNeedles();
+}
+
+void moveNeedles()
+{
+  while (hourStepper.distanceToGo() != 0 || minuteStepper.distanceToGo() != 0)
+  {
+    if(hourStepper.distanceToGo() != 0){
+      
+      hourStepper.run();
+    }
+
+    if(minuteStepper.distanceToGo() != 0){
+      
+      minuteStepper.run();
+    }
+    
+  }
+}
